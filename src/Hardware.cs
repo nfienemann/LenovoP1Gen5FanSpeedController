@@ -14,7 +14,7 @@ internal sealed class ThinkPad : IDisposable
     // N3JET32W DSDT: EC.TMP0, GPUT, HFSP and HSPD. The dual-fan mux
     // follows thinkpad_acpi: change only bit 0 and read tach low byte first.
     private const byte FanMode = 0x2f, FanSelect = 0x31, Cpu = 0x78, Gpu = 0x79;
-    internal const byte Maximum = 7, Automatic = 0x80;
+    internal const byte Level7 = 7, FullSpeed = 0x40, Automatic = 0x80;
     private const byte Data = 0x62, Command = 0x66;
     private readonly SafeFileHandle device;
     private readonly Mutex ecLock = new Mutex(false, @"Global\Access_EC");
@@ -152,7 +152,7 @@ internal sealed class ThinkPad : IDisposable
         internal int CpuC, GpuC;
         internal readonly int[] Rpm = new int[2], Mode = new int[2];
         internal bool BothAuto { get { return Mode.All(m => (m & 0xf8) == Automatic); } }
-        internal bool BothMax { get { return Mode.All(m => m == Maximum); } }
+        internal bool BothAt(byte target) { return Mode.All(m => m == target); }
         public override string ToString()
         {
             return string.Format("CPU={0}C GPU_EC={1} RPM={2}/{3} mode=0x{4:X2}/0x{5:X2}",
@@ -183,9 +183,23 @@ internal sealed class ThinkPad : IDisposable
         });
         return s;
     }
+    internal bool HasLatchedManualMode()
+    {
+        bool found = false;
+        Locked(delegate {
+            try {
+                for (int fan = 1; fan >= 0; fan--) {
+                    Select(fan);
+                    byte mode = Register(FanMode);
+                    found |= mode == Level7 || mode == FullSpeed;
+                }
+            } finally { Select(0); }
+        });
+        return found;
+    }
     internal void SetBoth(byte mode)
     {
-        if (mode != Maximum && mode != Automatic) throw new ArgumentOutOfRangeException("mode");
+        if (mode != Level7 && mode != FullSpeed && mode != Automatic) throw new ArgumentOutOfRangeException("mode");
         Locked(delegate {
             Exception error = null;
             try {

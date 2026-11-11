@@ -12,11 +12,31 @@ Reading settings works as a standard user. To save or reset them, open **Adminis
 
 | Option | Default | Behavior |
 | --- | ---: | --- |
-| `--engage-above` | 70°C | Either valid sensor strictly above this value requests regulated level 7 on both fans. At exactly 70°C the default policy stays in its previous mode. |
+| `--engage-above` | 70°C | Either valid sensor strictly above this value requests the selected speed on both fans. At exactly 70°C the default policy stays in its previous mode. |
 | `--release-at` | 65°C | Both sensors must be at or below this value throughout the cooldown period. A warmer sample restarts the timer. |
 | `--hold-seconds` | 15 s | Time spent continuously cool before the firmware takes over. Zero releases on the first qualifying sample. |
+| `--fan-mode` | `level7` | The speed to request during a hot interval. Choices are `level7` (regulated) and `full-speed` (unregulated). |
 
-Use whole numbers. The release threshold must be at least 1°C and below the engage threshold. The engage threshold must be at most 126°C. The hold time must be a nonnegative 32-bit integer. Those limits describe the accepted input format. The default thresholds are the ones tested on hardware.
+Use whole numbers for temperatures and time. The release threshold must be at least 1°C and below the engage threshold. The engage threshold must be at most 126°C. The hold time must be a nonnegative 32-bit integer. The default thresholds are the ones tested on hardware.
+
+## Optional unregulated full speed
+
+**Risk.** In `full-speed` mode the embedded controller disables closed-loop RPM regulation. Fans can run beyond their rated limits, with more noise and possible accelerated wear or hardware damage. Some ThinkPads can report stale RPM during ramp-up. If software loses access to the controller, it may be unable to restore automatic mode immediately. On the tested P1 Gen 5, a 2.3-second trial measured about 4% more RPM on each fan. That measurement does not establish safe sustained operation or a cooling benefit. [ThinkPad fan-level documentation](https://docs.kernel.org/admin-guide/laptops/thinkpad-acpi.html#fan-levels)
+
+**Opt in** from Administrator PowerShell. The command changes only the requested speed. It preserves your thresholds, cooldown duration and any cooldown time already elapsed. If the fans are already in a hot interval, both switch on the next poll. Otherwise the selection takes effect at the next hot interval. The selection persists across reboots.
+
+```powershell
+& $fan config set --fan-mode full-speed
+```
+
+**Switch back to regulated level 7** while keeping your temperature settings, then verify the saved selection.
+
+```powershell
+& $fan config set --fan-mode level7
+& $fan config show
+```
+
+Stopping the service asks the firmware to take control immediately. The saved mode still applies when the service starts again. To restore both level 7 and all three factory policy values for this utility, use `& $fan config reset`.
 
 ## Change or reset settings
 
@@ -33,13 +53,13 @@ Change all three values together and read them back.
 & $fan config show
 ```
 
-Restore the original 70°C / 65°C / 15-second policy.
+Restore regulated level 7 and the original 70°C / 65°C / 15-second policy.
 
 ```powershell
 & $fan config reset
 ```
 
-Each update saves the three settings together. An invalid command exits with an error and preserves the previous settings. The service resets its cooldown timer when it applies a change. The current fan mode carries over until a transition condition is met. Settings are stored in the service's `Parameters` registry key and survive an in-place upgrade.
+Each update saves the settings together. An invalid command exits with an error and preserves the previous settings. Changing a temperature or hold time restarts the cooldown timer. Changing only the fan mode preserves that timer. Settings are stored in the service's `Parameters` registry key and survive an in-place upgrade.
 
 ## Check operation and control startup
 
@@ -48,7 +68,7 @@ Get-Service ThinkPadP1FanPolicy | Select-Object Name, Status, StartType
 Get-Content "$env:ProgramFiles\ThinkPad P1 Fan Policy\controller.log" -Tail 15
 ```
 
-The log records policy changes, handoffs to firmware, temperatures, RPM and mode readbacks. `MAX` means the service requested regulated level 7. `AUTO` means cooling is under firmware control. A hot reading from either available sensor can request level 7. With one sensor missing and no valid hot reading, the policy hands control to the firmware.
+The log records policy changes, handoffs to firmware, temperatures, RPM and mode readbacks. `MAX` means the service requested regulated level 7. `FULL` means it requested unregulated full speed. `AUTO` means cooling is under firmware control. A hot reading from either available sensor can request the selected speed. With one sensor missing and no valid hot reading, the policy hands control to the firmware.
 
 To return control to the firmware for the current session, stop the service from Administrator PowerShell. Start it again to resume monitoring.
 

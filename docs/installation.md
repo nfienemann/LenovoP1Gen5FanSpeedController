@@ -5,7 +5,7 @@ This independent project controls both fans on a verified ThinkPad P1 Gen 5 conf
 ## Before installing
 
 - Use 64-bit Windows PowerShell on Windows 11 x64. Setup uses the Windows .NET Framework 4.x C# compiler. Visual Studio, Git and a separate .NET SDK are optional.
-- Download and extract the complete [version 1.0.0 ZIP](https://github.com/nfienemann/LenovoP1Gen5FanSpeedController/archive/refs/tags/v1.0.0.zip). Keep `src`, `Build.ps1` and `Setup.ps1` together. Commands below run from the extracted folder containing those files.
+- Download and extract the complete [version 1.1.0 ZIP](https://github.com/nfienemann/LenovoP1Gen5FanSpeedController/archive/refs/tags/v1.1.0.zip). Keep `src`, `Build.ps1` and `Setup.ps1` together. Commands below run from the extracted folder containing those files.
 - First installation requires an administrator account or administrator approval and an internet connection for the signed hardware-access components. Exit any other fan controller, including FanControl or TPFanControl, before the fan test.
 
 ### Check compatibility first
@@ -42,7 +42,7 @@ Expect `Running` and `Automatic`. The service can show `AUTO` in the log while i
 
 ## Upgrade or remove
 
-For an upgrade, extract the new version into its own folder and run `.\Setup.ps1 -Mode Install`. Setup prepares the new files, stops the old service, repeats the hardware check and starts the replacement. It preserves saved thresholds and sets startup to Automatic. If installation fails during replacement, setup attempts to restore the previous files and a previously running service.
+For an upgrade, extract the new version into its own folder and run `.\Setup.ps1 -Mode Install`. Setup prepares the new files, stops the old service, repeats the regulated level-7 hardware check and starts the replacement. It preserves saved thresholds and sets startup to Automatic. Upgrades from v1.0.0 select level 7. A previously saved full-speed opt-in from v1.1.0 carries through a reinstall. Before downgrading to v1.0.0, select `level7` to save your thresholds in the older version's format. If installation fails during replacement, setup attempts to restore the previous files and a previously running service. [Fan mode commands](configuration.md#optional-unregulated-full-speed)
 
 To uninstall, run the following from the extracted project folder and approve elevation.
 

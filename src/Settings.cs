@@ -11,13 +11,15 @@ internal sealed class Settings
     private const string ValueName = "TemperaturePolicyV1";
     internal static readonly Settings Default = new Settings(70, 65, 15);
     internal readonly int EngageAbove, ReleaseAt, HoldSeconds;
+    internal readonly bool FullSpeed;
+    internal string FanModeName { get { return FullSpeed ? "full-speed" : "level7"; } }
 
-    internal Settings(int engage, int release, int hold)
+    internal Settings(int engage, int release, int hold, bool fullSpeed = false)
     {
         if (release < 1 || engage > 126 || release >= engage)
             throw new ArgumentException("Use 1 <= release-at < engage-above <= 126 degrees C.");
         if (hold < 0) throw new ArgumentException("hold-seconds must be zero or greater.");
-        EngageAbove = engage; ReleaseAt = release; HoldSeconds = hold;
+        EngageAbove = engage; ReleaseAt = release; HoldSeconds = hold; FullSpeed = fullSpeed;
     }
     private static int Number(string s)
     {
@@ -28,14 +30,22 @@ internal sealed class Settings
     }
     internal string Encode()
     {
-        return string.Format(CultureInfo.InvariantCulture, "{0}/{1}/{2}", EngageAbove, ReleaseAt, HoldSeconds);
+        string thermal = string.Format(CultureInfo.InvariantCulture, "{0}/{1}/{2}", EngageAbove, ReleaseAt, HoldSeconds);
+        // Keep the original v1.0 representation for every regulated policy.
+        return FullSpeed ? thermal + "/full-speed" : thermal;
+    }
+    private static bool ParseMode(string name)
+    {
+        if (name == "level7") return false;
+        if (name == "full-speed") return true;
+        throw new ArgumentException("Expected --fan-mode level7 or full-speed.");
     }
     internal static Settings Decode(string raw)
     {
         if (raw == null) return Default;
         string[] fields = raw.Split('/');
-        if (fields.Length != 3) throw new InvalidDataException("Invalid saved policy. Run config reset.");
-        return new Settings(Number(fields[0]), Number(fields[1]), Number(fields[2]));
+        if (fields.Length != 3 && fields.Length != 4) throw new InvalidDataException("Invalid saved policy. Run config reset.");
+        return new Settings(Number(fields[0]), Number(fields[1]), Number(fields[2]), fields.Length == 4 && ParseMode(fields[3]));
     }
     internal static string ReadRaw()
     {
@@ -49,25 +59,27 @@ internal sealed class Settings
     {
         if (args.Length < 4 || args.Length % 2 != 0) throw new ArgumentException("Supply one or more option/value pairs. See help.");
         int engage = previous.EngageAbove, release = previous.ReleaseAt, hold = previous.HoldSeconds;
+        bool fullSpeed = previous.FullSpeed;
         var seen = new HashSet<string>(StringComparer.Ordinal);
         for (int i = 2; i < args.Length; i += 2)
         {
             if (!seen.Add(args[i])) throw new ArgumentException("Duplicate option " + args[i]);
-            int value = Number(args[i + 1]);
+            string value = args[i + 1];
             switch (args[i])
             {
-                case "--engage-above": engage = value; break;
-                case "--release-at": release = value; break;
-                case "--hold-seconds": hold = value; break;
+                case "--engage-above": engage = Number(value); break;
+                case "--release-at": release = Number(value); break;
+                case "--hold-seconds": hold = Number(value); break;
+                case "--fan-mode": fullSpeed = ParseMode(value); break;
                 default: throw new ArgumentException("Unknown option " + args[i]);
             }
         }
-        return new Settings(engage, release, hold);
+        return new Settings(engage, release, hold, fullSpeed);
     }
     public override string ToString()
     {
-        return string.Format("Engage above {0} C | Release at or below {1} C | Hold cool for {2} seconds",
-            EngageAbove, ReleaseAt, HoldSeconds);
+        return string.Format("Engage above {0} C | Release at or below {1} C | Hold cool for {2} seconds | Fan mode: {3}",
+            EngageAbove, ReleaseAt, HoldSeconds, FanModeName);
     }
     internal static void Command(string[] args)
     {

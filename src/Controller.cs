@@ -13,7 +13,19 @@ internal sealed class FanPolicy
     private double? coolSince;
     internal Settings Limits = Settings.Default;
     internal void Reset() { coolSince = null; High = false; }
-    internal void Configure(Settings limits) { Limits = limits; coolSince = null; }
+    internal void Configure(Settings limits)
+    {
+        if (Limits.EngageAbove != limits.EngageAbove || Limits.ReleaseAt != limits.ReleaseAt ||
+            Limits.HoldSeconds != limits.HoldSeconds) coolSince = null;
+        Limits = limits;
+    }
+    internal byte TargetMode
+    {
+        get {
+            if (!High) return ThinkPad.Automatic;
+            return Limits.FullSpeed ? ThinkPad.FullSpeed : ThinkPad.Level7;
+        }
+    }
     internal bool High { get; private set; }
     internal static bool Valid(int c) { return c >= 1 && c < 128; }
     internal bool Update(int cpu, int gpu, double now)
@@ -34,6 +46,26 @@ internal sealed class FanPolicy
         }
         else coolSince = null;
         return High;
+    }
+}
+
+// A two-fan write can fail after the first fan accepted the command. In that
+// case the next automatic handoff must run even if the last known mode was auto.
+internal sealed class FanOutput
+{
+    private readonly Action<byte> write;
+    internal byte Mode { get; private set; }
+    internal bool NeedsRestore { get; private set; }
+    internal FanOutput(Action<byte> write) { this.write = write; Mode = ThinkPad.Automatic; }
+    internal bool Apply(byte target, ThinkPad.Sample feedback = null)
+    {
+        if (!NeedsRestore && Mode == target &&
+            (target == ThinkPad.Automatic || feedback == null || feedback.BothAt(target))) return false;
+        NeedsRestore = true;
+        write(target);
+        Mode = target;
+        NeedsRestore = false;
+        return true;
     }
 }
 
@@ -136,13 +168,13 @@ internal static class Controller
         var recent = new System.Collections.Generic.Queue<int[]>();
         bool separate = false;
         try {
-            pc.SetBoth(ThinkPad.Maximum);
+            pc.SetBoth(ThinkPad.Level7);
             for (int i = 0; i < 55; i++)
             {
                 Thread.Sleep(1000);
                 var s = pc.Read();
                 Log("Level 7 test " + s);
-                if (!s.BothMax) throw new IOException("Firmware did not retain the maximum command.");
+                if (!s.BothAt(ThinkPad.Level7)) throw new IOException("Firmware did not retain the regulated level 7 command.");
                 if (s.Rpm.Any(r => r >= 12000)) throw new IOException("Invalid tachometer reading.");
                 separate |= Math.Abs(s.Rpm[0] - s.Rpm[1]) > 40;
                 bool response = Enumerable.Range(0, 2).All(f => s.Rpm[f] > 1500 && s.Rpm[f] >= baseline[f] + 150);
@@ -183,6 +215,54 @@ internal static class Controller
             throw new IOException("Accepted invalid config " + bad);
         }
         Console.WriteLine("PASS: CPU/GPU entry, 70 C boundary, dead band, 15 s dwell, interrupted dwell, unavailable sensors.");
+        TestFanModes();
+    }
+    private static void TestFanModes()
+    {
+        var legacy = Settings.Decode("70/65/15");
+        var faster = Settings.Edit(legacy, new[] { "config", "set", "--fan-mode", "full-speed" });
+        var regulated = Settings.Edit(faster, new[] { "config", "set", "--fan-mode", "level7" });
+        if (Settings.Decode(null).FullSpeed || legacy.FullSpeed || regulated.Encode() != legacy.Encode() ||
+            faster.Encode() != "70/65/15/full-speed" || !Settings.Decode(faster.Encode()).FullSpeed ||
+            !Settings.Edit(faster, new[] {"config","set","--hold-seconds","20"}).FullSpeed)
+            throw new IOException("Fan-mode persistence or legacy migration regression.");
+        foreach (string bad in new[] {"64", "0x40", "full", ""}) {
+            try { Settings.Edit(legacy, new[] {"config","set","--fan-mode",bad}); }
+            catch (ArgumentException) { continue; }
+            throw new IOException("Accepted an unknown fan mode.");
+        }
+        var policy = new FanPolicy();
+        var writes = new System.Collections.Generic.List<byte>();
+        var output = new FanOutput(writes.Add);
+        // Only an in-memory action sees these commands. No hardware or registry is opened.
+        policy.Configure(faster);
+        policy.Update(70, 70, 0); output.Apply(policy.TargetMode);
+        policy.Update(68, 71, 1); output.Apply(policy.TargetMode);
+        policy.Update(67, 68, 2); output.Apply(policy.TargetMode);
+        var feedback = new ThinkPad.Sample();
+        feedback.Mode[0] = feedback.Mode[1] = ThinkPad.FullSpeed;
+        output.Apply(policy.TargetMode, feedback);
+        feedback.Mode[1] = ThinkPad.Level7;
+        output.Apply(policy.TargetMode, feedback);
+        policy.Update(65, 65, 3);
+        policy.Configure(regulated); output.Apply(policy.TargetMode);
+        policy.Configure(faster); output.Apply(policy.TargetMode);
+        policy.Update(65, 65, 17); output.Apply(policy.TargetMode);
+        policy.Update(65, 65, 18); output.Apply(policy.TargetMode);
+        policy.Configure(Settings.Default);
+        policy.Update(71, 65, 19); output.Apply(policy.TargetMode);
+        if (!writes.SequenceEqual(new byte[] {0x40, 0x40, 7, 0x40, 0x80, 7}))
+            throw new IOException("Unexpected fan command sequence in simulation.");
+        bool restored = false;
+        var partial = new FanOutput(delegate(byte mode) {
+            if (mode == ThinkPad.FullSpeed) throw new IOException("Simulated partial write.");
+            restored = mode == ThinkPad.Automatic;
+        });
+        try { partial.Apply(ThinkPad.FullSpeed); } catch (IOException) { }
+        if (!partial.NeedsRestore) throw new IOException("Lost partial fan write.");
+        partial.Apply(ThinkPad.Automatic);
+        if (!restored || partial.NeedsRestore) throw new IOException("Automatic-mode recovery failed in simulation.");
+        Console.WriteLine("PASS: level7 default, full-speed opt-in, persistence, live opt-out, hysteresis, readback and recovery (simulated).");
     }
     public static int Main(string[] args)
     {
@@ -193,7 +273,9 @@ internal static class Controller
                     "config show     Display the saved machine-wide policy (defaults before installation)\n" +
                     "config set      Change one or more values from Administrator PowerShell\n" +
                     "                --engage-above C  --release-at C  --hold-seconds SECONDS\n" +
-                    "config reset    Restore 70 C / 65 C / 15 seconds (administrator)\n" +
+                    "                --fan-mode level7|full-speed (default: level7)\n" +
+                    "                Full-speed disables closed-loop RPM regulation and can exceed hardware limits.\n" +
+                    "config reset    Restore level7 and 70 C / 65 C / 15 seconds (administrator)\n" +
                     "Use Setup.ps1 for installation or removal.");
                 return 0;
             }
@@ -236,7 +318,8 @@ internal sealed class FanService : ServiceBase
     private readonly FanPolicy policy = new FanPolicy();
     private string previousSettings;
     private bool settingsLoaded;
-    private bool suspended, owns;
+    private bool suspended, checkStartupMode = true;
+    private FanOutput output;
     private double lastTick = -10, lastLogged = -100, commandTime, lastFanCheck = -100;
     private PerformanceCounter thermal;
     internal FanService()
@@ -247,6 +330,10 @@ internal sealed class FanService : ServiceBase
     protected override void OnStart(string[] args)
     {
         pc = new ThinkPad();
+        output = new FanOutput(delegate(byte mode) {
+            if (mode == ThinkPad.Automatic) Controller.Restore(pc);
+            else pc.SetBoth(mode);
+        });
         thermal = new PerformanceCounter("Thermal Zone Information", "High Precision Temperature", @"\_TZ.THM0", true);
         thread = new Thread(Run) { IsBackground = true };
         thread.Start();
@@ -254,13 +341,21 @@ internal sealed class FanService : ServiceBase
     private void Relinquish()
     {
         policy.Reset();
-        if (owns) { Controller.Restore(pc); owns = false; Controller.Log("Released both fans to Lenovo."); }
+        if (output.Apply(ThinkPad.Automatic)) {
+            Controller.Log("Released both fans to Lenovo.");
+        }
     }
     private void Tick()
     {
         double now = clock.Elapsed.TotalSeconds;
-        if (now - lastTick > 6) Relinquish();
+        if (output.NeedsRestore || now - lastTick > 6) Relinquish();
         lastTick = now;
+        if (checkStartupMode) {
+            // An interrupted two-fan write can leave just one fan latched.
+            // Recover before reading temperatures or relying on tachometers.
+            if (pc.HasLatchedManualMode()) Controller.Restore(pc);
+            checkStartupMode = false;
+        }
         string raw = Settings.ReadRaw();
         if (!settingsLoaded || raw != previousSettings) {
             try {
@@ -268,7 +363,9 @@ internal sealed class FanService : ServiceBase
                 policy.Configure(limits);
                 Controller.Log("Applied policy: " + limits);
             } catch (Exception ex) {
-                Controller.Log("Keeping the last valid policy. " + ex.Message);
+                var last = policy.Limits;
+                policy.Configure(new Settings(last.EngageAbove, last.ReleaseAt, last.HoldSeconds));
+                Controller.Log("Invalid saved policy. Using level7 with the last valid thresholds. " + ex.Message);
             }
             previousSettings = raw;
             settingsLoaded = true;
@@ -287,30 +384,25 @@ internal sealed class FanService : ServiceBase
             if (!FanPolicy.Valid(gpu)) gpu = feedback.GpuC;
         }
         bool high = policy.Update(cpu, gpu, now);
-        if (high && owns && now - lastFanCheck >= 6)
+        byte target = policy.TargetMode;
+        if (high && output.Mode == target && now - lastFanCheck >= 6)
         {
             feedback = feedback ?? pc.Read();
             lastFanCheck = now;
             if (now - commandTime > 15 && feedback.Rpm.Any(r => r < 500 || r >= 12000))
                 throw new IOException("Fan tachometer feedback lost at maximum.");
         }
-        if (high && (!owns || (feedback != null && !feedback.BothMax)))
+        if (high && output.Apply(target, feedback))
         {
-            owns = true; // Also recover an interrupted two-fan write.
-            pc.SetBoth(ThinkPad.Maximum);
             commandTime = now; lastFanCheck = now;
-            Controller.Log("Engaged maximum regulated speed. CPU=" + cpu + "C GPU=" + gpu + "C.");
+            Controller.Log("Engaged " + policy.Limits.FanModeName + ". CPU=" + cpu + "C GPU=" + gpu + "C.");
         }
-        else if (!high && owns) Relinquish();
-        else if (!high && lastLogged < 0 && (feedback ?? pc.Read()).BothMax)
-        {
-            // Recover a latched maximum from an interrupted previous service.
-            owns = true; Relinquish();
-        }
+        else if (!high && output.Mode != ThinkPad.Automatic) Relinquish();
         if (now - lastLogged >= 30)
         {
-            feedback = feedback ?? pc.Read();
-            Controller.Log((owns ? "MAX" : "AUTO") + " Windows CPU=" + cpu + "C NVIDIA/effective GPU=" + gpu + "C. " + feedback);
+            var state = output.Mode == ThinkPad.Automatic ? "AUTO" : (output.Mode == ThinkPad.FullSpeed ? "FULL" : "MAX");
+            feedback = pc.Read();
+            Controller.Log(state + " Windows CPU=" + cpu + "C NVIDIA/effective GPU=" + gpu + "C. " + feedback);
             lastLogged = now;
         }
     }
